@@ -4,12 +4,17 @@ import tldextract
 import subprocess
 import os
 import hmac
-import logging
 from logging.handlers import RotatingFileHandler
+import sys
+import threading
+import traceback
+from werkzeug.exceptions import HTTPException
+import logging
+from flask import got_request_exception
 
 WHITELIST_PATH = r"C:\Squid\etc\squid\whitelist.txt"
 SQUID_BIN = r"C:\Squid\bin\squid.exe"
-PYTHON_VVER = os.getenv("PYTHON_VVER") #1.246.43
+PYTHON_VVER = "1.246.43" # os.getenv("PYTHON_VVER")
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 5566
 REQUEST_TIMEOUT = 15
@@ -35,6 +40,50 @@ fh.setLevel(logging.INFO)
 fh.setFormatter(fmt)
 logger.addHandler(fh)
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(e: HTTPException):
+    # e.code, e.description, e.name
+    logger.warning("HTTP exception: %s %s %s from %s", e.code, e.name, e.description, request.remote_addr)
+    payload = {
+        "error": "http_error",
+        "code": e.code,
+        "name": e.name,
+        "description": e.description
+    }
+    return jsonify(payload), e.code
+
+# 2) generic exception handler — обязательно возвращает Response
+@app.errorhandler(Exception)
+def handle_all_exceptions(e):
+    if isinstance(e, HTTPException):
+        return handle_http_exception(e)
+
+    logger.exception("Unhandled exception (returned 500) during request %s %s: %s", request.method, request.path, e)
+
+    return jsonify({"error": "internal_server_error"}), 500
+
+# Перехват необработанных исключений в основном потоке
+def handle_uncaught_exception(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+
+sys.excepthook = handle_uncaught_exception
+
+# Перехват необработанных исключений в потоках
+def thread_excepthook(args):
+    # args: threading.ExceptHookArgs with .exc_type/.exc_value/.exc_traceback/.thread
+    logger.critical("Uncaught thread exception in %s", getattr(args, "thread", None), exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+threading.excepthook = thread_excepthook
+
+# Перехват исключений в обработках Flask
+def log_flask_exception(sender, exception, **extra):
+    logger.exception("Unhandled exception during request: %s", exception)
+
+got_request_exception.connect(log_flask_exception, app)
+
 logger.info("Logger initialized. Log file: %s", LOG_FILE)
 
 def version(ver):
@@ -52,10 +101,6 @@ def normal_from_url(url):
     return None
 
 def add_domains_to_whitelist(domains):
-    # read existing lines
-    if not os.path.exists(WHITELIST_PATH):
-        os.makedirs(WHITELIST_PATH, exist_ok=True)
-        open(WHITELIST_PATH, "w", encoding="utf-8").close()
     with open(WHITELIST_PATH, "r", encoding="utf-8") as f:
         existing = {ln.strip().lower() for ln in f if ln.strip()}
     logger.debug("existing: \n{%s}" % existing)
@@ -91,6 +136,7 @@ def resolve_redirects():
     if not data or "http" not in data:
         logger.warning("No URL provided")
         return jsonify({"error":"No URL provided"}), 400
+    logger.info("resolving for {%s}" % data)
 
     try:
         session = requests.Session()
@@ -108,40 +154,47 @@ def resolve_redirects():
 
     if len(chain_urls) > MAX_REDIRECTS + 1:
         chain_urls = chain_urls[:MAX_REDIRECTS+1]
+    try:
+        domains = set()
+        for u in chain_urls:
+            d = normal_from_url(u)
+            domains.add(d)
+        logger.info("get domains!")
 
-    domains = set()
-    for u in chain_urls:
-        d = normal_from_url(u)
-        domains.add(d)
-    logger.info("get domains!")
+        logger.info("adding domains!")
+        added = add_domains_to_whitelist(domains)
 
-    logger.info("adding domains!")
-    added = add_domains_to_whitelist(domains)
+        logger.info("reloading squid!")
+        ok, msg = reload_squid()
 
-    logger.info("reloading squid!")
-    ok, msg = reload_squid()
+        result = {
+            "start_url": data,
+            "chain_urls": chain_urls,
+            "domains_extracted": list(domains),
+            "domains_added": added,
+            "squid_reload_ok": ok,
+            "squid_msg": msg
+        }
+        logger.info("RESULT!")
 
-    result = {
-        "start_url": data,
-        "chain_urls": chain_urls,
-        "domains_extracted": list(domains),
-        "domains_added": added,
-        "squid_reload_ok": ok,
-        "squid_msg": msg
-    }
-    logger.info("RESULT!")
-
-    if ok:
-        logger.info("RESOLVE!")
-    else:
-        logger.error("not resolved: \n{%s}" % result)
-
-    return jsonify(result), (200 if ok else 500)
+        if ok:
+            logger.info("RESOLVE!")
+        else:
+            logger.error("not resolved: \n{%s: added=%s squid_ok=%s}", data, added, ok)
+        return jsonify(result), (200 if ok else 500)
+    except Exception as e:
+        logger.exception("Error in resolve_redirects for %s", data)
+        # возвращаем понятный JSON и 500
+        return jsonify({"error": "internal_server_error", "detail": str(e)}), 500
 
 @app.route("/ping")
 def ping():
     logger.debug("ping")
     return "СЮДА СМОТРИ!"
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 if __name__ == "__main__":
     logger.info("Starting redirect resolver on http://%s:%d" % (LISTEN_HOST, LISTEN_PORT))
